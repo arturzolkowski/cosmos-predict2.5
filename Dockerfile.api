@@ -1,0 +1,77 @@
+# Dockerfile.api — Cosmos Predict2.5 OSS API container (multiarch)
+#
+# Uses the nightly approach (pip requirements) for cross-platform compatibility,
+# then copies source code and nim_api_persistent.py.
+#
+# Build (multiarch — must build each arch sequentially to avoid apt cache conflicts):
+#   REPO=gitlab-master.nvidia.com:5005/dl/joc/cosmos-genai-nim/predict2_oss
+#   TAG=v1.5.0-nightly-jetart
+#
+#   # Step 1: build each arch
+#   docker buildx build --builder multiplatform-builder --platform linux/amd64 \
+#     -f Dockerfile.api -t ${REPO}:${TAG}-amd64 --push .
+#   docker buildx build --builder multiplatform-builder --platform linux/arm64 \
+#     -f Dockerfile.api -t ${REPO}:${TAG}-arm64 --push .
+#
+#   # Step 2: extract per-arch digests and create multiarch manifest
+#   AMD64=$(docker manifest inspect ${REPO}:${TAG}-amd64 | python3 -c "import sys,json;[print(p['digest']) for p in json.load(sys.stdin)['manifests'] if p['platform']['architecture']=='amd64']")
+#   ARM64=$(docker manifest inspect ${REPO}:${TAG}-arm64 | python3 -c "import sys,json;[print(p['digest']) for p in json.load(sys.stdin)['manifests'] if p['platform']['architecture']=='arm64']")
+#   docker manifest create --amend ${REPO}:${TAG} ${REPO}@${AMD64} ${REPO}@${ARM64}
+#   docker manifest push ${REPO}:${TAG}
+#
+# Build (local, single arch):
+#   docker build -f Dockerfile.api -t cosmos-predict2.5-api:latest .
+#
+# Run (1 GPU):
+#   docker run --gpus all --ipc=host --shm-size=16g --network host \
+#     -e HF_TOKEN=$HF_TOKEN <image> \
+#     torchrun --nproc_per_node=1 /workspace/nim_api_persistent.py
+#
+# Run (multi-GPU):
+#   docker run --gpus all --ipc=host --shm-size=16g --network host \
+#     -e HF_TOKEN=$HF_TOKEN <image> \
+#     torchrun --nproc_per_node=N /workspace/nim_api_persistent.py
+
+ARG TARGETPLATFORM
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3
+
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl ffmpeg git git-lfs libx11-dev tree wget && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:0.8.12 /uv /uvx /usr/local/bin/
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin --tag 1.42.4
+
+WORKDIR /workspace
+
+# Install dependencies from requirements (cross-platform compatible)
+COPY docker/nightly-requirements.txt /tmp/requirements.txt
+COPY packages packages
+RUN uv pip install --system --break-system-packages -r /tmp/requirements.txt && \
+    pip install --no-deps packages/*
+
+# Copy source code and install
+COPY . /workspace/
+RUN pip install --no-deps -e .
+
+# Install API server dependencies
+RUN pip install fastapi "uvicorn[standard]"
+
+COPY nim_api_persistent.py /workspace/nim_api_persistent.py
+
+RUN mkdir -p /root/.cache/huggingface/hub /.cache /tmp/.cache && \
+    chmod -R 777 /.cache /tmp/.cache
+
+ENV NCCL_CUMEM_HOST_ENABLE=0
+ENV TORCHINDUCTOR_CACHE_DIR=/tmp/.cache/
+ENV TRANSFORMERS_CACHE=/tmp/.cache/
+
+EXPOSE 8000
+
+CMD ["/bin/bash"]
